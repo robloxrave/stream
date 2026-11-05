@@ -115,6 +115,15 @@ const CONFIG = {
     stallSeconds: 5           // no audio packets for this long means reconnect
   },
 
+  // Low-latency playback in a normal player (MediaSource), test route: ?route=mse
+  mse: {
+    wrapperUrl: 'https://cdn.jsdelivr.net/npm/mse-audio-wrapper@1.4.15/+esm',
+    targetLagSeconds: 0.4,    // how far behind the newest audio to play
+    maxLagSeconds: 1.0,       // further behind than this: jump forward
+    keepSeconds: 15,          // old audio to keep in memory
+    startTimeoutMs: 8000      // no audio by then: use the normal stream
+  },
+
   // Automatic catch-up (gentle): only jumps to live if you stay far behind for a while.
   autoCatchUp: true,           // set to false to turn automatic catch-up off completely
   maxLagSeconds: 20,           // "far behind" means more than this many seconds
@@ -259,6 +268,7 @@ let statusKey = 'stopped';
 // Test switches, for test.html only: ?test=icecast skips WebRTC, ?test=timeout makes it never connect.
 const testMode = new URLSearchParams(location.search).get('test');
 const webrtcSupported = typeof RTCPeerConnection !== 'undefined';
+const useMse = new URLSearchParams(location.search).get('route') === 'mse' && 'MediaSource' in window;
 
 // ?debug=1 shows what the page is doing, for testing on phones.
 const debugOn = new URLSearchParams(location.search).get('debug') === '1';
@@ -291,12 +301,17 @@ let lastPackets = -1;
 let stalledSeconds = 0;
 let webrtcConnected = false;
 let userPaused = false;      // the listener paused on purpose
+let mseAbort = null;         // stops the MediaSource download
+let mseTimer = null;         // start timeout
+let mseBuffer = null;
+let mseObjectUrl = '';
 let retryPending = false;
 
 function setStatus(key) { statusKey = key; statusEl.textContent = t(key); }
 
 function showTransport() {
   if (transport === 'webrtc') transportEl.textContent = t('modeLow');
+  else if (transport === 'mse') transportEl.textContent = t('modeLow') + ' · MSE';
   else if (transport === 'icecast') transportEl.textContent = t('modeStandard');
   else transportEl.textContent = '';
 }
@@ -329,10 +344,12 @@ function connect() {
   ignorePauseUntil = Date.now() + 1500;
   setStatus('connecting');
   closeWebRTC();
+  closeMse();
   transport = '';
   showTransport();
   const skipWebRTC = !CONFIG.webrtc.enabled || !webrtcSupported || useIcecast || testMode === 'icecast';
-  if (skipWebRTC) connectIcecast();
+  if (useMse && !useIcecast && testMode !== 'icecast') connectMse(id);
+  else if (skipWebRTC) connectIcecast();
   else connectWebRTC(id);
   updateButtons();
 }
@@ -351,6 +368,121 @@ function startPlaying() {
       // AbortError just means a newer connect() replaced this one; ignore it.
     });
   }
+}
+
+// ---- Low latency in a normal player (MediaSource) ------------------------
+// Download the normal Icecast stream ourselves, rewrap it for MediaSource, and feed
+// the page's normal audio element while keeping only a tiny buffer.
+function closeMse() {
+  clearTimeout(mseTimer);
+  if (mseAbort) mseAbort.abort();
+  mseAbort = null;
+  mseBuffer = null;
+  if (mseObjectUrl) URL.revokeObjectURL(mseObjectUrl);
+  mseObjectUrl = '';
+}
+
+function seekToLive() {
+  if (!audio.buffered.length) return;
+  const end = audio.buffered.end(audio.buffered.length - 1);
+  audio.currentTime = Math.max(0, end - CONFIG.mse.targetLagSeconds);
+}
+
+function waitForBuffer(buffer) {
+  return new Promise((resolve, reject) => {
+    const finish = event => {
+      buffer.removeEventListener('updateend', finish);
+      buffer.removeEventListener('error', finish);
+      if (event.type === 'error') reject(new Error('SourceBuffer error'));
+      else resolve();
+    };
+    buffer.addEventListener('updateend', finish);
+    buffer.addEventListener('error', finish);
+  });
+}
+
+async function appendToBuffer(buffer, data) {
+  const done = waitForBuffer(buffer);
+  buffer.appendBuffer(data);
+  await done;
+}
+
+// Browsers limit how much audio MediaSource may hold, so drop what we have already played.
+async function trimBuffer(buffer) {
+  if (!buffer.buffered.length) return;
+  const start = buffer.buffered.start(0);
+  const end = buffer.buffered.end(buffer.buffered.length - 1);
+  const keepFrom = (audio.paused ? end : audio.currentTime) - CONFIG.mse.keepSeconds;
+  if (keepFrom - start < CONFIG.mse.keepSeconds) return;
+  const done = waitForBuffer(buffer);
+  buffer.remove(start, keepFrom);
+  await done;
+}
+
+async function connectMse(id) {
+  const controller = new AbortController();
+  const mediaSource = new MediaSource();
+  let playing = false;
+  mseAbort = controller;
+  transport = 'mse';
+  mseObjectUrl = URL.createObjectURL(mediaSource);
+  audio.srcObject = null;
+  audio.src = mseObjectUrl;
+  startPlaying();   // inside the click, so the browser allows sound
+  mseTimer = setTimeout(() => fallBackToIcecast(id, 'mse start timeout'), CONFIG.mse.startTimeoutMs);
+  if (testMode === 'timeout') return;
+
+  try {
+    const { default: MSEAudioWrapper } = await import(CONFIG.mse.wrapperUrl);
+    if (mediaSource.readyState !== 'open') {
+      await new Promise(resolve => mediaSource.addEventListener('sourceopen', resolve, { once: true }));
+    }
+    const res = await fetch(liveUrl(), { cache: 'no-store', signal: controller.signal });
+    log('mse HTTP ' + res.status);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const wrapper = new MSEAudioWrapper('application/ogg', {
+      preferredContainer: 'webm',
+      minFramesPerSegment: 1,
+      minBytesPerSegment: 0,
+      maxFramesPerSegment: 50
+    });
+    const reader = res.body.getReader();
+
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) throw new Error('stream ended');
+      if (id !== connectId) return;
+      for (const fragment of wrapper.iterator(value)) {
+        if (!mseBuffer) {
+          mseBuffer = mediaSource.addSourceBuffer(wrapper.mimeType);
+          mseBuffer.mode = 'sequence';   // play in arrival order and ignore the stream's timestamps
+          log('mse ' + wrapper.mimeType);
+        }
+        await appendToBuffer(mseBuffer, fragment);
+      }
+      if (!playing && mseBuffer && mseBuffer.buffered.length &&
+          mseBuffer.buffered.end(0) >= CONFIG.mse.targetLagSeconds) {
+        playing = true;
+        clearTimeout(mseTimer);
+        seekToLive();
+        startPlaying();
+      }
+      await trimBuffer(mseBuffer);
+    }
+  } catch (err) {
+    if (controller.signal.aborted || id !== connectId) return;
+    console.warn('MediaSource playback stopped:', err);
+    log('mse stopped: ' + err);
+    if (playing) retryMse();
+    else fallBackToIcecast(id, String(err));
+  }
+}
+
+function retryMse() {
+  setStatus('reconnecting');
+  clearTimeout(retryTimer);
+  retryPending = true;
+  retryTimer = setTimeout(connect, CONFIG.retryDelayMs);
 }
 
 function connectIcecast() {
@@ -462,6 +594,7 @@ function fallBackToIcecast(id, reason) {
   useIcecast = true;
   ignorePauseUntil = Date.now() + 1500;
   closeWebRTC();
+  closeMse();
   connectIcecast();
   updateButtons();
 }
@@ -494,6 +627,7 @@ setInterval(checkWebRTCFlow, 1000);
 function resume() {
   userPaused = false;
   if (staleConnection || (!audio.src && !audio.srcObject)) { connect(); return; }
+  if (transport === 'mse') seekToLive();
   const p = audio.play();
   if (p && p.catch) p.catch(() => connect());
 }
@@ -533,8 +667,15 @@ function syncUI() {
   if (!started) return;
   updateButtons();
   if (transport === 'icecast' && !userPaused && audio.error && !retryPending) handleDrop();
+  if (transport === 'mse' && !audio.paused) {
+    const lag = currentLag();
+    if (lag !== null && lag > CONFIG.mse.maxLagSeconds) {
+      log('jump to live, lag ' + lag.toFixed(2));
+      seekToLive();
+    }
+  }
   const sounding = !audio.paused &&
-    (transport === 'webrtc' ? webrtcConnected : transport === 'icecast' && audio.readyState >= 3);
+    (transport === 'webrtc' ? webrtcConnected : transport !== '' && audio.readyState >= 3);
   if (sounding) {
     if (statusKey !== 'live') setStatus('live');
     showTransport();
@@ -572,7 +713,7 @@ function updateLagUI() {
   let state = 'good', hint = t('hintGood');
   if (lag > CONFIG.lagWarnSeconds) { state = 'bad'; hint = t('hintBad'); }
   else if (lag > CONFIG.lagGoodSeconds) { state = 'warn'; hint = t('hintWarn'); }
-  showLag(t('lagSeconds')(lag.toFixed(0)), width, state, hint);
+  showLag(t('lagSeconds')(lag.toFixed(transport === 'mse' ? 1 : 0)), width, state, hint);
   return lag;
 }
 
