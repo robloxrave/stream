@@ -51,6 +51,10 @@
   .lagbox[data-state="bad"]  #lagFill { background: #ff5c5c; }
   #lagHint { font-size: 0.78rem; opacity: 0.65; margin: 6px 0 0; min-height: 1em; }
 
+  #debugLog {
+    margin: 20px 0 0; padding: 10px; border-radius: 10px; background: #000; color: #9fe8b0;
+    text-align: left; font-size: 0.7rem; line-height: 1.4; white-space: pre-wrap; word-break: break-word;
+  }
   .how {
     margin-top: 24px; padding: 16px 16px 8px; border-radius: 14px; background: #17122b;
     text-align: left; font-size: 0.92rem; line-height: 1.65;
@@ -85,6 +89,7 @@
     <ol id="steps"></ol>
   </section>
 
+  <pre id="debugLog" hidden></pre>
   <audio id="audio" preload="none"></audio>
 </main>
 
@@ -255,6 +260,27 @@ let statusKey = 'stopped';
 const testMode = new URLSearchParams(location.search).get('test');
 const webrtcSupported = typeof RTCPeerConnection !== 'undefined';
 
+// ?debug=1 shows what the page is doing, for testing on phones.
+const debugOn = new URLSearchParams(location.search).get('debug') === '1';
+const debugEl = document.getElementById('debugLog');
+const debugLines = [];
+function log(text) {
+  if (!debugOn) return;
+  debugLines.push((performance.now() / 1000).toFixed(1) + ' ' + text);
+  if (debugLines.length > 60) debugLines.shift();
+  debugEl.hidden = false;
+  debugEl.textContent = debugLines.join('\n');
+}
+if (debugOn) {
+  log(navigator.userAgent);
+  window.addEventListener('error', e => log('JS ERROR ' + e.message + ' line ' + e.lineno));
+  window.addEventListener('unhandledrejection', e => log('REJECTED ' + e.reason));
+  ['loadstart', 'canplay', 'playing', 'pause', 'waiting', 'stalled', 'emptied', 'ended', 'error'].forEach(name => {
+    audio.addEventListener(name, () => log('audio ' + name + ' paused=' + audio.paused +
+      ' ready=' + audio.readyState + (audio.error ? ' err=' + audio.error.code : '')));
+  });
+}
+
 let transport = '';          // what is attached to the player: 'webrtc', 'icecast' or ''
 let useIcecast = false;      // WebRTC failed, so stay on the normal stream for now
 let connectId = 0;           // each connect gets a number, so old attempts can't interfere
@@ -263,6 +289,9 @@ let webrtcTimer = null;      // connect timeout
 let dropTimer = null;        // grace period after a network blip
 let lastPackets = -1;
 let stalledSeconds = 0;
+let webrtcConnected = false;
+let userPaused = false;      // the listener paused on purpose
+let retryPending = false;
 
 function setStatus(key) { statusKey = key; statusEl.textContent = t(key); }
 
@@ -291,7 +320,10 @@ function liveUrl() {
 function connect() {
   clearTimeout(retryTimer);
   const id = ++connectId;
+  log('connect #' + id + (useIcecast ? ' (icecast)' : ''));
   started = true;
+  userPaused = false;
+  retryPending = false;
   staleConnection = false;
   lagStrikes = 0;
   ignorePauseUntil = Date.now() + 1500;
@@ -309,9 +341,12 @@ function startPlaying() {
   const p = audio.play();
   if (p && p.catch) {
     p.catch(err => {
+      log('play rejected: ' + (err && err.name));
       if (err && err.name === 'NotAllowedError') {
         setStatus('tapToStart');
         updateButtons();
+      } else if (err && err.name === 'NotSupportedError') {
+        handleDrop();   // nothing to play yet, for example when the DJ is off air
       }
       // AbortError just means a newer connect() replaced this one; ignore it.
     });
@@ -332,6 +367,7 @@ function closeWebRTC() {
   clearTimeout(dropTimer);
   lastPackets = -1;
   stalledSeconds = 0;
+  webrtcConnected = false;
   if (!webrtcPc) return;
   audio.srcObject = null;
   webrtcPc.close();
@@ -353,22 +389,35 @@ async function connectWebRTC(id) {
   audio.srcObject = stream;
   startPlaying();
 
-  webrtcTimer = setTimeout(() => fallBackToIcecast(id), CONFIG.webrtc.connectTimeoutMs);
+  webrtcTimer = setTimeout(() => fallBackToIcecast(id, 'timeout'), CONFIG.webrtc.connectTimeoutMs);
   pc.addTransceiver('audio', { direction: 'recvonly' });
-  pc.ontrack = event => stream.addTrack(event.track);
+  // Attach the real audio and press play again: this is what makes the player start reliably.
+  pc.ontrack = event => {
+    log('track arrived');
+    ignorePauseUntil = Date.now() + 1500;
+    audio.srcObject = new MediaStream([event.track]);
+    startPlaying();
+  };
+  pc.oniceconnectionstatechange = () => log('ice ' + pc.iceConnectionState);
+  pc.onicegatheringstatechange = () => log('gathering ' + pc.iceGatheringState);
   pc.onconnectionstatechange = () => {
+    log('connection ' + pc.connectionState);
     if (id !== connectId) return;
     const state = pc.connectionState;
     if (state === 'connected') {
       connected = true;
+      webrtcConnected = true;
       clearTimeout(webrtcTimer);
       clearTimeout(dropTimer);
+      setStatus('live');
+      showTransport();
+      updateButtons();
     } else if (state === 'disconnected') {
       clearTimeout(dropTimer);
       dropTimer = setTimeout(() => { if (id === connectId) reconnectAfterDrop(); }, CONFIG.webrtc.dropGraceMs);
     } else if (state === 'failed') {
       if (connected) reconnectAfterDrop();
-      else fallBackToIcecast(id);
+      else fallBackToIcecast(id, 'connection failed');
     }
   };
 
@@ -383,13 +432,17 @@ async function connectWebRTC(id) {
       headers: { 'Content-Type': 'application/sdp' },
       body: pc.localDescription.sdp
     });
+    log('whep HTTP ' + res.status);
     if (!res.ok) throw new Error('HTTP ' + res.status);
+    // The setup above can be slow on phones, so the audio path gets its own full timeout.
+    clearTimeout(webrtcTimer);
+    webrtcTimer = setTimeout(() => fallBackToIcecast(id, 'timeout'), CONFIG.webrtc.connectTimeoutMs);
     const answer = await res.text();
     if (id !== connectId) return;
     await pc.setRemoteDescription({ type: 'answer', sdp: answer });
   } catch (err) {
     console.warn('WebRTC unavailable:', err);
-    fallBackToIcecast(id);
+    fallBackToIcecast(id, String(err));
   }
 }
 
@@ -403,8 +456,9 @@ function waitForAddresses(pc) {
   });
 }
 
-function fallBackToIcecast(id) {
+function fallBackToIcecast(id, reason) {
   if (id !== connectId) return;
+  log('fallback to icecast: ' + reason);
   useIcecast = true;
   ignorePauseUntil = Date.now() + 1500;
   closeWebRTC();
@@ -420,7 +474,7 @@ function reconnectAfterDrop() {
 // A BUTT reconnect can leave the connection open but silent, so watch the packets arrive.
 async function checkWebRTCFlow() {
   const pc = webrtcPc;
-  if (!pc || pc.connectionState !== 'connected' || audio.paused) { stalledSeconds = 0; return; }
+  if (!pc || pc.connectionState !== 'connected' || userPaused) { stalledSeconds = 0; return; }
   const stats = await pc.getStats();
   if (pc !== webrtcPc) return;
   let packets = 0;
@@ -429,12 +483,16 @@ async function checkWebRTCFlow() {
   });
   stalledSeconds = packets === lastPackets ? stalledSeconds + 1 : 0;
   lastPackets = packets;
-  if (stalledSeconds >= CONFIG.webrtc.stallSeconds) reconnectAfterDrop();
+  if (stalledSeconds >= CONFIG.webrtc.stallSeconds) {
+    log('no packets for ' + stalledSeconds + ' s');
+    reconnectAfterDrop();
+  }
 }
 setInterval(checkWebRTCFlow, 1000);
 
 // Normal resume after a pause: continue where it left off, unless the connection died meanwhile.
 function resume() {
+  userPaused = false;
   if (staleConnection || (!audio.src && !audio.srcObject)) { connect(); return; }
   const p = audio.play();
   if (p && p.catch) p.catch(() => connect());
@@ -446,7 +504,8 @@ function goLive() { useIcecast = false; connect(); }
 toggleBtn.addEventListener('click', () => {
   if (!started) connect();
   else if (audio.paused) resume();
-  else audio.pause();
+  else { userPaused = true; audio.pause(); }
+  updateButtons();
 });
 resyncBtn.addEventListener('click', goLive);
 
@@ -455,17 +514,35 @@ audio.addEventListener('pause', () => {
   if (Date.now() < ignorePauseUntil) return;
   setStatus('paused'); setMediaState('paused'); updateButtons();
 });
-audio.addEventListener('waiting', () => { if (!audio.paused) setStatus('buffering'); });
+audio.addEventListener('waiting', () => { if (!audio.paused && transport !== 'webrtc') setStatus('buffering'); });
 
 // If the connection drops while playing, reconnect. If it drops while paused, wait for the next play.
 function handleDrop() {
   if (!started || transport === 'webrtc') return;   // WebRTC watches its own connection
-  if (audio.paused) { staleConnection = true; return; }
+  if (userPaused) { staleConnection = true; return; }
+  log('dropped, retrying soon');
   setStatus('reconnecting');
   clearTimeout(retryTimer);
+  retryPending = true;
   useIcecast = false;   // the normal stream dropped too, so try WebRTC first next time
   retryTimer = setTimeout(connect, CONFIG.retryDelayMs);
 }
+
+// Audio events aren't reliable enough on their own, so check the real state every second.
+function syncUI() {
+  if (!started) return;
+  updateButtons();
+  if (transport === 'icecast' && !userPaused && audio.error && !retryPending) handleDrop();
+  const sounding = !audio.paused &&
+    (transport === 'webrtc' ? webrtcConnected : transport === 'icecast' && audio.readyState >= 3);
+  if (sounding) {
+    if (statusKey !== 'live') setStatus('live');
+    showTransport();
+  } else if (userPaused && statusKey !== 'paused') {
+    setStatus('paused');
+  }
+}
+setInterval(syncUI, 1000);
 audio.addEventListener('error', handleDrop);
 audio.addEventListener('ended', handleDrop);
 
@@ -578,7 +655,7 @@ if ('mediaSession' in navigator) {
   navigator.mediaSession.metadata = makeMetadata(CONFIG.title, 'LIVE');
   const setAction = (name, fn) => { try { navigator.mediaSession.setActionHandler(name, fn); } catch (e) {} };
   setAction('play', () => { started ? resume() : connect(); });
-  setAction('pause', () => audio.pause());
+  setAction('pause', () => { userPaused = true; audio.pause(); });
   setAction('nexttrack', goLive);    // "Next" button = jump to live
   setAction('seekforward', goLive);  // "Forward" button = jump to live (shown on some phones)
 }
