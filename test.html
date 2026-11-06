@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ADHD RAVE (test)</title>
+<title>ADHD RAVE</title>
 <style>
   :root { color-scheme: dark; }
   body {
@@ -51,10 +51,6 @@
   .lagbox[data-state="bad"]  #lagFill { background: #ff5c5c; }
   #lagHint { font-size: 0.78rem; opacity: 0.65; margin: 6px 0 0; min-height: 1em; }
 
-  #debugLog {
-    margin: 20px 0 0; padding: 10px; border-radius: 10px; background: #000; color: #9fe8b0;
-    text-align: left; font-size: 0.7rem; line-height: 1.4; white-space: pre-wrap; word-break: break-word;
-  }
   .how {
     margin-top: 24px; padding: 16px 16px 8px; border-radius: 14px; background: #17122b;
     text-align: left; font-size: 0.92rem; line-height: 1.65;
@@ -89,7 +85,6 @@
     <ol id="steps"></ol>
   </section>
 
-  <pre id="debugLog" hidden></pre>
   <audio id="audio" preload="none"></audio>
 </main>
 
@@ -105,19 +100,10 @@ const CONFIG = {
   cacheBust: true,        // adds ?t=<time> on each connect so the browser never reuses an old connection
   retryDelayMs: 3000,     // wait this long before reconnecting after a dropout
 
-  // Low-latency playback (WebRTC). Falls back to the normal stream if it can't connect.
-  webrtc: {
+  // Low-latency playback. Falls back to the normal stream if it can't start.
+  lowLatency: {
     enabled: true,
-    stunUrl: 'stun:stun.l.google.com:19302',  // helps the browser and the server find each other
-    connectTimeoutMs: 8000,   // give up and use the normal stream after this long
-    gatherTimeoutMs: 2000,    // the most time to spend collecting network addresses
-    dropGraceMs: 5000,        // a short network blip can recover by itself; wait this long
-    stallSeconds: 5           // no audio packets for this long means reconnect
-  },
-
-  // Low-latency playback in a normal player (MediaSource), test route: ?route=mse
-  mse: {
-    wrapperUrl: 'https://cdn.jsdelivr.net/npm/mse-audio-wrapper@1.4.15/+esm',
+    wrapperUrl: './vendor/mse-audio-wrapper-1.4.15.js',
     targetLagSeconds: 0.4,    // how far behind the newest audio to play
     maxLagSeconds: 1.0,       // further behind than this: jump forward
     keepSeconds: 15,          // old audio to keep in memory
@@ -161,8 +147,6 @@ const STRINGS = {
     lagPaused: '일시정지됨',
     lagMeasuring: '측정 중...',
     lagSeconds: s => '약 ' + s + '초',
-    lagLow: '1초 미만',
-    hintLow: '실시간에 가까워요',
     modeLow: '저지연 모드',
     modeStandard: '일반 모드',
     hintPaused: '⏩ 버튼을 누르면 라이브 위치로 돌아와요',
@@ -197,8 +181,6 @@ const STRINGS = {
     lagPaused: 'Paused',
     lagMeasuring: 'measuring...',
     lagSeconds: s => '~' + s + ' s',
-    lagLow: 'under 1 s',
-    hintLow: 'Close to real time',
     modeLow: 'Low latency',
     modeStandard: 'Standard',
     hintPaused: 'Press ⏩ to rejoin the live point',
@@ -265,53 +247,21 @@ let lastAutoJump = 0;
 let ignorePauseUntil = 0;     // our own reconnects can fire a spurious "pause" event
 let statusKey = 'stopped';
 
-// Test switches, for test.html only: ?test=icecast skips WebRTC, ?test=timeout makes it never connect.
-const testMode = new URLSearchParams(location.search).get('test');
-const webrtcSupported = typeof RTCPeerConnection !== 'undefined';
-const useMse = new URLSearchParams(location.search).get('route') === 'mse' && 'MediaSource' in window;
-
-// ?debug=1 shows what the page is doing, for testing on phones.
-const debugOn = new URLSearchParams(location.search).get('debug') === '1';
-const debugEl = document.getElementById('debugLog');
-const debugLines = [];
-function log(text) {
-  if (!debugOn) return;
-  debugLines.push((performance.now() / 1000).toFixed(1) + ' ' + text);
-  if (debugLines.length > 60) debugLines.shift();
-  debugEl.hidden = false;
-  debugEl.textContent = debugLines.join('\n');
-}
-if (debugOn) {
-  log(navigator.userAgent);
-  window.addEventListener('error', e => log('JS ERROR ' + e.message + ' line ' + e.lineno));
-  window.addEventListener('unhandledrejection', e => log('REJECTED ' + e.reason));
-  ['loadstart', 'canplay', 'playing', 'pause', 'waiting', 'stalled', 'emptied', 'ended', 'error'].forEach(name => {
-    audio.addEventListener(name, () => log('audio ' + name + ' paused=' + audio.paused +
-      ' ready=' + audio.readyState + (audio.error ? ' err=' + audio.error.code : '')));
-  });
-}
-
-let transport = '';          // what is attached to the player: 'webrtc', 'icecast' or ''
-let useIcecast = false;      // WebRTC failed, so stay on the normal stream for now
+const lowLatencySupported = CONFIG.lowLatency.enabled && 'MediaSource' in window;
+let transport = '';          // what is attached to the player: 'lowLatency', 'icecast' or ''
+let useIcecast = false;      // low latency failed, so stay on the normal stream for now
 let connectId = 0;           // each connect gets a number, so old attempts can't interfere
-let webrtcPc = null;
-let webrtcTimer = null;      // connect timeout
-let dropTimer = null;        // grace period after a network blip
-let lastPackets = -1;
-let stalledSeconds = 0;
-let webrtcConnected = false;
 let userPaused = false;      // the listener paused on purpose
-let mseAbort = null;         // stops the MediaSource download
-let mseTimer = null;         // start timeout
-let mseBuffer = null;
-let mseObjectUrl = '';
 let retryPending = false;
+let streamAbort = null;      // stops the low-latency download
+let startTimer = null;       // low-latency start timeout
+let sourceBuffer = null;     // where the low-latency audio goes
+let mediaSourceUrl = '';
 
 function setStatus(key) { statusKey = key; statusEl.textContent = t(key); }
 
 function showTransport() {
-  if (transport === 'webrtc') transportEl.textContent = t('modeLow');
-  else if (transport === 'mse') transportEl.textContent = t('modeLow') + ' · MSE';
+  if (transport === 'lowLatency') transportEl.textContent = t('modeLow');
   else if (transport === 'icecast') transportEl.textContent = t('modeStandard');
   else transportEl.textContent = '';
 }
@@ -335,7 +285,6 @@ function liveUrl() {
 function connect() {
   clearTimeout(retryTimer);
   const id = ++connectId;
-  log('connect #' + id + (useIcecast ? ' (icecast)' : ''));
   started = true;
   userPaused = false;
   retryPending = false;
@@ -343,14 +292,11 @@ function connect() {
   lagStrikes = 0;
   ignorePauseUntil = Date.now() + 1500;
   setStatus('connecting');
-  closeWebRTC();
-  closeMse();
+  closeLowLatency();
   transport = '';
   showTransport();
-  const skipWebRTC = !CONFIG.webrtc.enabled || !webrtcSupported || useIcecast || testMode === 'icecast';
-  if (useMse && !useIcecast && testMode !== 'icecast') connectMse(id);
-  else if (skipWebRTC) connectIcecast();
-  else connectWebRTC(id);
+  if (lowLatencySupported && !useIcecast) connectLowLatency(id);
+  else connectIcecast();
   updateButtons();
 }
 
@@ -358,7 +304,6 @@ function startPlaying() {
   const p = audio.play();
   if (p && p.catch) {
     p.catch(err => {
-      log('play rejected: ' + (err && err.name));
       if (err && err.name === 'NotAllowedError') {
         setStatus('tapToStart');
         updateButtons();
@@ -370,22 +315,31 @@ function startPlaying() {
   }
 }
 
-// ---- Low latency in a normal player (MediaSource) ------------------------
-// Download the normal Icecast stream ourselves, rewrap it for MediaSource, and feed
-// the page's normal audio element while keeping only a tiny buffer.
-function closeMse() {
-  clearTimeout(mseTimer);
-  if (mseAbort) mseAbort.abort();
-  mseAbort = null;
-  mseBuffer = null;
-  if (mseObjectUrl) URL.revokeObjectURL(mseObjectUrl);
-  mseObjectUrl = '';
+function connectIcecast() {
+  transport = 'icecast';
+  audio.src = liveUrl();
+  audio.load();
+  startPlaying();
+}
+
+// ---- Low-latency playback ------------------------------------------------
+// The browser's own stream player keeps a few seconds in reserve. So the page downloads
+// the same stream itself, rewraps it for MediaSource, and feeds the same audio element
+// while holding only a tiny buffer. It stays a normal player, so phones keep their
+// notification controls and it can play beside other apps.
+function closeLowLatency() {
+  clearTimeout(startTimer);
+  if (streamAbort) streamAbort.abort();
+  streamAbort = null;
+  sourceBuffer = null;
+  if (mediaSourceUrl) URL.revokeObjectURL(mediaSourceUrl);
+  mediaSourceUrl = '';
 }
 
 function seekToLive() {
   if (!audio.buffered.length) return;
   const end = audio.buffered.end(audio.buffered.length - 1);
-  audio.currentTime = Math.max(0, end - CONFIG.mse.targetLagSeconds);
+  audio.currentTime = Math.max(0, end - CONFIG.lowLatency.targetLagSeconds);
 }
 
 function waitForBuffer(buffer) {
@@ -407,38 +361,35 @@ async function appendToBuffer(buffer, data) {
   await done;
 }
 
-// Browsers limit how much audio MediaSource may hold, so drop what we have already played.
+// Browsers limit how much audio MediaSource may hold, so drop what has already played.
 async function trimBuffer(buffer) {
   if (!buffer.buffered.length) return;
   const start = buffer.buffered.start(0);
   const end = buffer.buffered.end(buffer.buffered.length - 1);
-  const keepFrom = (audio.paused ? end : audio.currentTime) - CONFIG.mse.keepSeconds;
-  if (keepFrom - start < CONFIG.mse.keepSeconds) return;
+  const keepFrom = (audio.paused ? end : audio.currentTime) - CONFIG.lowLatency.keepSeconds;
+  if (keepFrom - start < CONFIG.lowLatency.keepSeconds) return;
   const done = waitForBuffer(buffer);
   buffer.remove(start, keepFrom);
   await done;
 }
 
-async function connectMse(id) {
+async function connectLowLatency(id) {
   const controller = new AbortController();
   const mediaSource = new MediaSource();
   let playing = false;
-  mseAbort = controller;
-  transport = 'mse';
-  mseObjectUrl = URL.createObjectURL(mediaSource);
-  audio.srcObject = null;
-  audio.src = mseObjectUrl;
+  streamAbort = controller;
+  transport = 'lowLatency';
+  mediaSourceUrl = URL.createObjectURL(mediaSource);
+  audio.src = mediaSourceUrl;
   startPlaying();   // inside the click, so the browser allows sound
-  mseTimer = setTimeout(() => fallBackToIcecast(id, 'mse start timeout'), CONFIG.mse.startTimeoutMs);
-  if (testMode === 'timeout') return;
+  startTimer = setTimeout(() => fallBackToIcecast(id), CONFIG.lowLatency.startTimeoutMs);
 
   try {
-    const { default: MSEAudioWrapper } = await import(CONFIG.mse.wrapperUrl);
+    const { default: MSEAudioWrapper } = await import(CONFIG.lowLatency.wrapperUrl);
     if (mediaSource.readyState !== 'open') {
       await new Promise(resolve => mediaSource.addEventListener('sourceopen', resolve, { once: true }));
     }
     const res = await fetch(liveUrl(), { cache: 'no-store', signal: controller.signal });
-    log('mse HTTP ' + res.status);
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const wrapper = new MSEAudioWrapper('application/ogg', {
       preferredContainer: 'webm',
@@ -453,186 +404,55 @@ async function connectMse(id) {
       if (done) throw new Error('stream ended');
       if (id !== connectId) return;
       for (const fragment of wrapper.iterator(value)) {
-        if (!mseBuffer) {
-          mseBuffer = mediaSource.addSourceBuffer(wrapper.mimeType);
-          mseBuffer.mode = 'sequence';   // play in arrival order and ignore the stream's timestamps
-          log('mse ' + wrapper.mimeType);
+        if (!sourceBuffer) {
+          sourceBuffer = mediaSource.addSourceBuffer(wrapper.mimeType);
+          sourceBuffer.mode = 'sequence';   // play in arrival order; the stream's timestamps can jump
         }
-        await appendToBuffer(mseBuffer, fragment);
+        await appendToBuffer(sourceBuffer, fragment);
       }
-      if (!playing && mseBuffer && mseBuffer.buffered.length &&
-          mseBuffer.buffered.end(0) >= CONFIG.mse.targetLagSeconds) {
+      if (!playing && sourceBuffer && sourceBuffer.buffered.length &&
+          sourceBuffer.buffered.end(0) >= CONFIG.lowLatency.targetLagSeconds) {
         playing = true;
-        clearTimeout(mseTimer);
+        clearTimeout(startTimer);
         seekToLive();
         startPlaying();
       }
-      await trimBuffer(mseBuffer);
+      if (sourceBuffer) await trimBuffer(sourceBuffer);
     }
   } catch (err) {
     if (controller.signal.aborted || id !== connectId) return;
-    console.warn('MediaSource playback stopped:', err);
-    log('mse stopped: ' + err);
-    if (playing) retryMse();
-    else fallBackToIcecast(id, String(err));
+    console.warn('Low-latency playback stopped:', err);
+    if (playing) retryLowLatency();
+    else fallBackToIcecast(id);
   }
 }
 
-function retryMse() {
+function retryLowLatency() {
   setStatus('reconnecting');
   clearTimeout(retryTimer);
   retryPending = true;
   retryTimer = setTimeout(connect, CONFIG.retryDelayMs);
 }
 
-function connectIcecast() {
-  transport = 'icecast';
-  audio.srcObject = null;
-  audio.src = liveUrl();
-  audio.load();
-  startPlaying();
-}
-
-// Detach the player first, so closing the connection can't look like a dropout.
-function closeWebRTC() {
-  clearTimeout(webrtcTimer);
-  clearTimeout(dropTimer);
-  lastPackets = -1;
-  stalledSeconds = 0;
-  webrtcConnected = false;
-  if (!webrtcPc) return;
-  audio.srcObject = null;
-  webrtcPc.close();
-  webrtcPc = null;
-}
-
-// Low-latency connection: the page and the server swap one offer and one answer over
-// HTTPS, then the audio travels directly between them.
-async function connectWebRTC(id) {
-  const pc = new RTCPeerConnection({ iceServers: [{ urls: CONFIG.webrtc.stunUrl }] });
-  const stream = new MediaStream();
-  let connected = false;
-  webrtcPc = pc;
-  transport = 'webrtc';
-
-  // Start the player now, inside the click: browsers may refuse once we have waited.
-  // The audio track joins this same stream when it arrives.
-  audio.removeAttribute('src');
-  audio.srcObject = stream;
-  startPlaying();
-
-  webrtcTimer = setTimeout(() => fallBackToIcecast(id, 'timeout'), CONFIG.webrtc.connectTimeoutMs);
-  pc.addTransceiver('audio', { direction: 'recvonly' });
-  // Attach the real audio and press play again: this is what makes the player start reliably.
-  pc.ontrack = event => {
-    log('track arrived');
-    ignorePauseUntil = Date.now() + 1500;
-    audio.srcObject = new MediaStream([event.track]);
-    startPlaying();
-  };
-  pc.oniceconnectionstatechange = () => log('ice ' + pc.iceConnectionState);
-  pc.onicegatheringstatechange = () => log('gathering ' + pc.iceGatheringState);
-  pc.onconnectionstatechange = () => {
-    log('connection ' + pc.connectionState);
-    if (id !== connectId) return;
-    const state = pc.connectionState;
-    if (state === 'connected') {
-      connected = true;
-      webrtcConnected = true;
-      clearTimeout(webrtcTimer);
-      clearTimeout(dropTimer);
-      setStatus('live');
-      showTransport();
-      updateButtons();
-    } else if (state === 'disconnected') {
-      clearTimeout(dropTimer);
-      dropTimer = setTimeout(() => { if (id === connectId) reconnectAfterDrop(); }, CONFIG.webrtc.dropGraceMs);
-    } else if (state === 'failed') {
-      if (connected) reconnectAfterDrop();
-      else fallBackToIcecast(id, 'connection failed');
-    }
-  };
-
-  if (testMode === 'timeout') return;
-
-  try {
-    await pc.setLocalDescription(await pc.createOffer());
-    await waitForAddresses(pc);
-    if (id !== connectId) return;
-    const res = await fetch(CONFIG.streamUrl + '/whep', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/sdp' },
-      body: pc.localDescription.sdp
-    });
-    log('whep HTTP ' + res.status);
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    // The setup above can be slow on phones, so the audio path gets its own full timeout.
-    clearTimeout(webrtcTimer);
-    webrtcTimer = setTimeout(() => fallBackToIcecast(id, 'timeout'), CONFIG.webrtc.connectTimeoutMs);
-    const answer = await res.text();
-    if (id !== connectId) return;
-    await pc.setRemoteDescription({ type: 'answer', sdp: answer });
-  } catch (err) {
-    console.warn('WebRTC unavailable:', err);
-    fallBackToIcecast(id, String(err));
-  }
-}
-
-function waitForAddresses(pc) {
-  return new Promise(resolve => {
-    if (pc.iceGatheringState === 'complete') { resolve(); return; }
-    setTimeout(resolve, CONFIG.webrtc.gatherTimeoutMs);
-    pc.addEventListener('icegatheringstatechange', () => {
-      if (pc.iceGatheringState === 'complete') resolve();
-    });
-  });
-}
-
-function fallBackToIcecast(id, reason) {
+function fallBackToIcecast(id) {
   if (id !== connectId) return;
-  log('fallback to icecast: ' + reason);
   useIcecast = true;
   ignorePauseUntil = Date.now() + 1500;
-  closeWebRTC();
-  closeMse();
+  closeLowLatency();
   connectIcecast();
   updateButtons();
 }
 
-function reconnectAfterDrop() {
-  setStatus('reconnecting');
-  connect();
-}
-
-// A BUTT reconnect can leave the connection open but silent, so watch the packets arrive.
-async function checkWebRTCFlow() {
-  const pc = webrtcPc;
-  if (!pc || pc.connectionState !== 'connected' || userPaused) { stalledSeconds = 0; return; }
-  const stats = await pc.getStats();
-  if (pc !== webrtcPc) return;
-  let packets = 0;
-  stats.forEach(report => {
-    if (report.type === 'inbound-rtp' && report.kind === 'audio') packets = report.packetsReceived;
-  });
-  stalledSeconds = packets === lastPackets ? stalledSeconds + 1 : 0;
-  lastPackets = packets;
-  if (stalledSeconds >= CONFIG.webrtc.stallSeconds) {
-    log('no packets for ' + stalledSeconds + ' s');
-    reconnectAfterDrop();
-  }
-}
-setInterval(checkWebRTCFlow, 1000);
-
 // Normal resume after a pause: continue where it left off, unless the connection died meanwhile.
 function resume() {
   userPaused = false;
-  if (staleConnection || (!audio.src && !audio.srcObject)) { connect(); return; }
-  if (transport === 'mse') seekToLive();
+  if (staleConnection || !audio.src) { connect(); return; }
+  if (transport === 'lowLatency') seekToLive();
   const p = audio.play();
   if (p && p.catch) p.catch(() => connect());
 }
 
-// Jump to live also gives WebRTC another chance.
+// Jump to live also gives low latency another chance.
 function goLive() { useIcecast = false; connect(); }
 
 toggleBtn.addEventListener('click', () => {
@@ -648,34 +468,29 @@ audio.addEventListener('pause', () => {
   if (Date.now() < ignorePauseUntil) return;
   setStatus('paused'); setMediaState('paused'); updateButtons();
 });
-audio.addEventListener('waiting', () => { if (!audio.paused && transport !== 'webrtc') setStatus('buffering'); });
+audio.addEventListener('waiting', () => { if (!audio.paused) setStatus('buffering'); });
 
 // If the connection drops while playing, reconnect. If it drops while paused, wait for the next play.
 function handleDrop() {
-  if (!started || transport === 'webrtc') return;   // WebRTC watches its own connection
+  if (!started) return;
   if (userPaused) { staleConnection = true; return; }
-  log('dropped, retrying soon');
   setStatus('reconnecting');
   clearTimeout(retryTimer);
   retryPending = true;
-  useIcecast = false;   // the normal stream dropped too, so try WebRTC first next time
+  useIcecast = false;   // the normal stream dropped too, so try low latency first next time
   retryTimer = setTimeout(connect, CONFIG.retryDelayMs);
 }
 
-// Audio events aren't reliable enough on their own, so check the real state every second.
+// Audio events aren't always reliable, so check the real state every second.
 function syncUI() {
   if (!started) return;
   updateButtons();
   if (transport === 'icecast' && !userPaused && audio.error && !retryPending) handleDrop();
-  if (transport === 'mse' && !audio.paused) {
+  if (transport === 'lowLatency' && !audio.paused) {
     const lag = currentLag();
-    if (lag !== null && lag > CONFIG.mse.maxLagSeconds) {
-      log('jump to live, lag ' + lag.toFixed(2));
-      seekToLive();
-    }
+    if (lag !== null && lag > CONFIG.lowLatency.maxLagSeconds) seekToLive();
   }
-  const sounding = !audio.paused &&
-    (transport === 'webrtc' ? webrtcConnected : transport !== '' && audio.readyState >= 3);
+  const sounding = !audio.paused && transport !== '' && audio.readyState >= 3;
   if (sounding) {
     if (statusKey !== 'live') setStatus('live');
     showTransport();
@@ -706,14 +521,13 @@ function showLag(text, width, state, hint) {
 function updateLagUI() {
   if (!started) { showLag('-', 0, '', ''); return null; }
   if (audio.paused) { showLag(t('lagPaused'), 0, 'paused', t('hintPaused')); return null; }
-  if (transport === 'webrtc') { showLag(t('lagLow'), 5, 'good', t('hintLow')); return null; }
   const lag = currentLag();
   if (lag === null) { showLag(t('lagMeasuring'), 0, '', ''); return null; }
   const width = Math.min(100, (lag / (CONFIG.lagWarnSeconds * 2)) * 100);
   let state = 'good', hint = t('hintGood');
   if (lag > CONFIG.lagWarnSeconds) { state = 'bad'; hint = t('hintBad'); }
   else if (lag > CONFIG.lagGoodSeconds) { state = 'warn'; hint = t('hintWarn'); }
-  showLag(t('lagSeconds')(lag.toFixed(transport === 'mse' ? 1 : 0)), width, state, hint);
+  showLag(t('lagSeconds')(lag.toFixed(transport === 'lowLatency' ? 1 : 0)), width, state, hint);
   return lag;
 }
 
