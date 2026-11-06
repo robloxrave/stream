@@ -27,7 +27,8 @@
     h1 .ch { animation: none; filter: hue-rotate(calc(var(--i) * 40deg)); }
   }
 
-  #status { margin: 0 0 20px; opacity: 0.8; }
+  #status { margin: 0 0 6px; opacity: 0.8; }
+  #transport { margin: 0 0 20px; min-height: 1.2em; font-size: 0.78rem; opacity: 0.65; }
   .label { font-size: 0.75rem; letter-spacing: 0.08em; text-transform: uppercase; opacity: 0.55; margin: 0; }
   #nowplaying { font-size: 1.15rem; margin: 4px 0 20px; word-break: break-word; }
 
@@ -65,6 +66,7 @@
   <img id="poster" class="poster" src="1792392198032.jpg" alt="" onerror="this.style.display='none'">
   <h1 id="title"></h1>
   <p id="status"></p>
+  <p id="transport"></p>
 
   <p class="label" id="npLabel"></p>
   <p id="nowplaying">-</p>
@@ -97,6 +99,16 @@ const CONFIG = {
 
   cacheBust: true,        // adds ?t=<time> on each connect so the browser never reuses an old connection
   retryDelayMs: 3000,     // wait this long before reconnecting after a dropout
+
+  // Low-latency playback. Falls back to the normal stream if it can't start.
+  lowLatency: {
+    enabled: true,
+    wrapperUrl: './vendor/mse-audio-wrapper-1.4.15.js',
+    targetLagSeconds: 0.4,    // how far behind the newest audio to play
+    maxLagSeconds: 1.0,       // further behind than this: jump forward
+    keepSeconds: 15,          // old audio to keep in memory
+    startTimeoutMs: 8000      // no audio by then: use the normal stream
+  },
 
   // Automatic catch-up (gentle): only jumps to live if you stay far behind for a while.
   autoCatchUp: true,           // set to false to turn automatic catch-up off completely
@@ -135,6 +147,8 @@ const STRINGS = {
     lagPaused: '일시정지됨',
     lagMeasuring: '측정 중...',
     lagSeconds: s => '약 ' + s + '초',
+    modeLow: '저지연 모드',
+    modeStandard: '일반 모드',
     hintPaused: '⏩ 버튼을 누르면 라이브 위치로 돌아와요',
     hintGood: '실시간과 거의 같아요',
     hintWarn: '조금 뒤처졌어요',
@@ -167,6 +181,8 @@ const STRINGS = {
     lagPaused: 'Paused',
     lagMeasuring: 'measuring...',
     lagSeconds: s => '~' + s + ' s',
+    modeLow: 'Low latency',
+    modeStandard: 'Standard',
     hintPaused: 'Press ⏩ to rejoin the live point',
     hintGood: 'In sync',
     hintWarn: 'A little behind',
@@ -184,6 +200,7 @@ const STRINGS = {
 
 const audio = document.getElementById('audio');
 const statusEl = document.getElementById('status');
+const transportEl = document.getElementById('transport');
 const toggleBtn = document.getElementById('toggle');
 const resyncBtn = document.getElementById('resync');
 const langBtn = document.getElementById('lang');
@@ -230,7 +247,24 @@ let lastAutoJump = 0;
 let ignorePauseUntil = 0;     // our own reconnects can fire a spurious "pause" event
 let statusKey = 'stopped';
 
+const lowLatencySupported = CONFIG.lowLatency.enabled && 'MediaSource' in window;
+let transport = '';          // what is attached to the player: 'lowLatency', 'icecast' or ''
+let useIcecast = false;      // low latency failed, so stay on the normal stream for now
+let connectId = 0;           // each connect gets a number, so old attempts can't interfere
+let userPaused = false;      // the listener paused on purpose
+let retryPending = false;
+let streamAbort = null;      // stops the low-latency download
+let startTimer = null;       // low-latency start timeout
+let sourceBuffer = null;     // where the low-latency audio goes
+let mediaSourceUrl = '';
+
 function setStatus(key) { statusKey = key; statusEl.textContent = t(key); }
+
+function showTransport() {
+  if (transport === 'lowLatency') transportEl.textContent = t('modeLow');
+  else if (transport === 'icecast') transportEl.textContent = t('modeStandard');
+  else transportEl.textContent = '';
+}
 
 function setMediaState(state) {
   if ('mediaSession' in navigator) navigator.mediaSession.playbackState = state;
@@ -250,43 +284,186 @@ function liveUrl() {
 // Open a fresh connection. A fresh connection starts at the live point.
 function connect() {
   clearTimeout(retryTimer);
+  const id = ++connectId;
   started = true;
+  userPaused = false;
+  retryPending = false;
   staleConnection = false;
   lagStrikes = 0;
   ignorePauseUntil = Date.now() + 1500;
   setStatus('connecting');
-  audio.src = liveUrl();
-  audio.load();
+  closeLowLatency();
+  transport = '';
+  showTransport();
+  if (lowLatencySupported && !useIcecast) connectLowLatency(id);
+  else connectIcecast();
+  updateButtons();
+}
+
+function startPlaying() {
   const p = audio.play();
   if (p && p.catch) {
     p.catch(err => {
       if (err && err.name === 'NotAllowedError') {
         setStatus('tapToStart');
         updateButtons();
+      } else if (err && err.name === 'NotSupportedError') {
+        handleDrop();   // nothing to play yet, for example when the DJ is off air
       }
       // AbortError just means a newer connect() replaced this one; ignore it.
     });
   }
+}
+
+function connectIcecast() {
+  transport = 'icecast';
+  audio.src = liveUrl();
+  audio.load();
+  startPlaying();
+}
+
+// ---- Low-latency playback ------------------------------------------------
+// The browser's own stream player keeps a few seconds in reserve. So the page downloads
+// the same stream itself, rewraps it for MediaSource, and feeds the same audio element
+// while holding only a tiny buffer. It stays a normal player, so phones keep their
+// notification controls and it can play beside other apps.
+function closeLowLatency() {
+  clearTimeout(startTimer);
+  if (streamAbort) streamAbort.abort();
+  streamAbort = null;
+  sourceBuffer = null;
+  if (mediaSourceUrl) URL.revokeObjectURL(mediaSourceUrl);
+  mediaSourceUrl = '';
+}
+
+function seekToLive() {
+  if (!audio.buffered.length) return;
+  const end = audio.buffered.end(audio.buffered.length - 1);
+  audio.currentTime = Math.max(0, end - CONFIG.lowLatency.targetLagSeconds);
+}
+
+function waitForBuffer(buffer) {
+  return new Promise((resolve, reject) => {
+    const finish = event => {
+      buffer.removeEventListener('updateend', finish);
+      buffer.removeEventListener('error', finish);
+      if (event.type === 'error') reject(new Error('SourceBuffer error'));
+      else resolve();
+    };
+    buffer.addEventListener('updateend', finish);
+    buffer.addEventListener('error', finish);
+  });
+}
+
+async function appendToBuffer(buffer, data) {
+  const done = waitForBuffer(buffer);
+  buffer.appendBuffer(data);
+  await done;
+}
+
+// Browsers limit how much audio MediaSource may hold, so drop what has already played.
+async function trimBuffer(buffer) {
+  if (!buffer.buffered.length) return;
+  const start = buffer.buffered.start(0);
+  const end = buffer.buffered.end(buffer.buffered.length - 1);
+  const keepFrom = (audio.paused ? end : audio.currentTime) - CONFIG.lowLatency.keepSeconds;
+  if (keepFrom - start < CONFIG.lowLatency.keepSeconds) return;
+  const done = waitForBuffer(buffer);
+  buffer.remove(start, keepFrom);
+  await done;
+}
+
+async function connectLowLatency(id) {
+  const controller = new AbortController();
+  const mediaSource = new MediaSource();
+  let playing = false;
+  streamAbort = controller;
+  transport = 'lowLatency';
+  mediaSourceUrl = URL.createObjectURL(mediaSource);
+  audio.src = mediaSourceUrl;
+  startPlaying();   // inside the click, so the browser allows sound
+  startTimer = setTimeout(() => fallBackToIcecast(id), CONFIG.lowLatency.startTimeoutMs);
+
+  try {
+    const { default: MSEAudioWrapper } = await import(CONFIG.lowLatency.wrapperUrl);
+    if (mediaSource.readyState !== 'open') {
+      await new Promise(resolve => mediaSource.addEventListener('sourceopen', resolve, { once: true }));
+    }
+    const res = await fetch(liveUrl(), { cache: 'no-store', signal: controller.signal });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const wrapper = new MSEAudioWrapper('application/ogg', {
+      preferredContainer: 'webm',
+      minFramesPerSegment: 1,
+      minBytesPerSegment: 0,
+      maxFramesPerSegment: 50
+    });
+    const reader = res.body.getReader();
+
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) throw new Error('stream ended');
+      if (id !== connectId) return;
+      for (const fragment of wrapper.iterator(value)) {
+        if (!sourceBuffer) {
+          sourceBuffer = mediaSource.addSourceBuffer(wrapper.mimeType);
+          sourceBuffer.mode = 'sequence';   // play in arrival order; the stream's timestamps can jump
+        }
+        await appendToBuffer(sourceBuffer, fragment);
+      }
+      if (!playing && sourceBuffer && sourceBuffer.buffered.length &&
+          sourceBuffer.buffered.end(0) >= CONFIG.lowLatency.targetLagSeconds) {
+        playing = true;
+        clearTimeout(startTimer);
+        seekToLive();
+        startPlaying();
+      }
+      if (sourceBuffer) await trimBuffer(sourceBuffer);
+    }
+  } catch (err) {
+    if (controller.signal.aborted || id !== connectId) return;
+    console.warn('Low-latency playback stopped:', err);
+    if (playing) retryLowLatency();
+    else fallBackToIcecast(id);
+  }
+}
+
+function retryLowLatency() {
+  setStatus('reconnecting');
+  clearTimeout(retryTimer);
+  retryPending = true;
+  retryTimer = setTimeout(connect, CONFIG.retryDelayMs);
+}
+
+function fallBackToIcecast(id) {
+  if (id !== connectId) return;
+  useIcecast = true;
+  ignorePauseUntil = Date.now() + 1500;
+  closeLowLatency();
+  connectIcecast();
   updateButtons();
 }
 
 // Normal resume after a pause: continue where it left off, unless the connection died meanwhile.
 function resume() {
+  userPaused = false;
   if (staleConnection || !audio.src) { connect(); return; }
+  if (transport === 'lowLatency') seekToLive();
   const p = audio.play();
   if (p && p.catch) p.catch(() => connect());
 }
 
-function goLive() { connect(); }
+// Jump to live also gives low latency another chance.
+function goLive() { useIcecast = false; connect(); }
 
 toggleBtn.addEventListener('click', () => {
   if (!started) connect();
   else if (audio.paused) resume();
-  else audio.pause();
+  else { userPaused = true; audio.pause(); }
+  updateButtons();
 });
 resyncBtn.addEventListener('click', goLive);
 
-audio.addEventListener('playing', () => { setStatus('live'); setMediaState('playing'); updateButtons(); });
+audio.addEventListener('playing', () => { setStatus('live'); showTransport(); setMediaState('playing'); updateButtons(); });
 audio.addEventListener('pause', () => {
   if (Date.now() < ignorePauseUntil) return;
   setStatus('paused'); setMediaState('paused'); updateButtons();
@@ -296,11 +473,32 @@ audio.addEventListener('waiting', () => { if (!audio.paused) setStatus('bufferin
 // If the connection drops while playing, reconnect. If it drops while paused, wait for the next play.
 function handleDrop() {
   if (!started) return;
-  if (audio.paused) { staleConnection = true; return; }
+  if (userPaused) { staleConnection = true; return; }
   setStatus('reconnecting');
   clearTimeout(retryTimer);
+  retryPending = true;
+  useIcecast = false;   // the normal stream dropped too, so try low latency first next time
   retryTimer = setTimeout(connect, CONFIG.retryDelayMs);
 }
+
+// Audio events aren't always reliable, so check the real state every second.
+function syncUI() {
+  if (!started) return;
+  updateButtons();
+  if (transport === 'icecast' && !userPaused && audio.error && !retryPending) handleDrop();
+  if (transport === 'lowLatency' && !audio.paused) {
+    const lag = currentLag();
+    if (lag !== null && lag > CONFIG.lowLatency.maxLagSeconds) seekToLive();
+  }
+  const sounding = !audio.paused && transport !== '' && audio.readyState >= 3;
+  if (sounding) {
+    if (statusKey !== 'live') setStatus('live');
+    showTransport();
+  } else if (userPaused && statusKey !== 'paused') {
+    setStatus('paused');
+  }
+}
+setInterval(syncUI, 1000);
 audio.addEventListener('error', handleDrop);
 audio.addEventListener('ended', handleDrop);
 
@@ -329,7 +527,7 @@ function updateLagUI() {
   let state = 'good', hint = t('hintGood');
   if (lag > CONFIG.lagWarnSeconds) { state = 'bad'; hint = t('hintBad'); }
   else if (lag > CONFIG.lagGoodSeconds) { state = 'warn'; hint = t('hintWarn'); }
-  showLag(t('lagSeconds')(lag.toFixed(0)), width, state, hint);
+  showLag(t('lagSeconds')(lag.toFixed(transport === 'lowLatency' ? 1 : 0)), width, state, hint);
   return lag;
 }
 
@@ -412,7 +610,7 @@ if ('mediaSession' in navigator) {
   navigator.mediaSession.metadata = makeMetadata(CONFIG.title, 'LIVE');
   const setAction = (name, fn) => { try { navigator.mediaSession.setActionHandler(name, fn); } catch (e) {} };
   setAction('play', () => { started ? resume() : connect(); });
-  setAction('pause', () => audio.pause());
+  setAction('pause', () => { userPaused = true; audio.pause(); });
   setAction('nexttrack', goLive);    // "Next" button = jump to live
   setAction('seekforward', goLive);  // "Forward" button = jump to live (shown on some phones)
 }
@@ -433,6 +631,7 @@ function applyLanguage() {
   });
   langBtn.textContent = t('langButton');
   setStatus(statusKey);
+  showTransport();
   updateButtons();
   updateLagUI();
   renderNowPlaying();
